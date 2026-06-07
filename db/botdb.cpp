@@ -1,0 +1,548 @@
+#include "botdb.h"
+#include <QDir>
+#include <QDebug>
+#include <cstring>
+#include <ctime>
+#ifdef Q_OS_WIN
+#include <windows.h>
+#endif
+
+BotDB::BotDB(const QString& path, size_t initialMapSizeMB)
+    : m_path(path), m_initialMapSize(initialMapSizeMB * 1024ULL * 1024ULL),
+    m_currentMapSize(0), m_env(nullptr), m_dbi_users(0), m_dbi_seq_idx(0), m_dbi_groups(0), m_dbi_friends(0)
+{
+    if (m_initialMapSize < 1ULL * 1024 * 1024)   // 最小 1MB
+        m_initialMapSize = 1ULL * 1024 * 1024;
+}
+
+BotDB::~BotDB()
+{
+    close();
+}
+
+// 在 Windows 上尝试将 data.mdb 设为稀疏文件
+bool BotDB::ensureSparseFile()
+{
+#ifdef Q_OS_WIN
+    if (!m_env) return false;
+    QString dataFile = m_path + "/data.mdb";
+    HANDLE hFile = CreateFileW((LPCWSTR)dataFile.utf16(),
+                               GENERIC_WRITE,
+                               FILE_SHARE_WRITE | FILE_SHARE_READ,
+                               NULL,
+                               OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL,
+                               NULL);
+    if (hFile == INVALID_HANDLE_VALUE)
+        return false;
+    DWORD dummy;
+    BOOL result = DeviceIoControl(hFile, FSCTL_SET_SPARSE, NULL, 0, NULL, 0, &dummy, NULL);
+    CloseHandle(hFile);
+    return result != 0;
+#else
+    return true;
+#endif
+}
+
+bool BotDB::open()
+{
+    if (m_env) close();
+
+    QDir dir;
+    if (!dir.mkpath(m_path)) {
+        qCritical() << "无法创建数据库目录:" << m_path;
+        return false;
+    }
+
+    m_currentMapSize = m_initialMapSize;
+
+    int rc = mdb_env_create(&m_env);
+    if (rc != MDB_SUCCESS) {
+        qCritical() << "mdb_env_create 失败:" << mdb_strerror(rc);
+        return false;
+    }
+    mdb_env_set_maxdbs(m_env, 10);
+    mdb_env_set_mapsize(m_env, m_currentMapSize);
+    QByteArray pathBytes = m_path.toUtf8();
+    rc = mdb_env_open(m_env, pathBytes.constData(), 0, 0664);
+    if (rc != MDB_SUCCESS) {
+        qCritical() << "mdb_env_open 失败:" << mdb_strerror(rc);
+        mdb_env_close(m_env);
+        m_env = nullptr;
+        return false;
+    }
+
+    // 设置为稀疏文件（Windows）
+    ensureSparseFile();
+
+    MDB_txn *txn = nullptr;
+    rc = mdb_txn_begin(m_env, nullptr, 0, &txn);
+    if (rc != MDB_SUCCESS) {
+        qCritical() << "mdb_txn_begin 失败:" << mdb_strerror(rc);
+        return false;
+    }
+
+    // 打开子数据库（注意：此处如果之前已经存在，会复用）
+    rc = mdb_dbi_open(txn, nullptr, MDB_CREATE, &m_dbi_users);
+    if (rc != MDB_SUCCESS) goto fail;
+    rc = mdb_dbi_open(txn, "seq_to_openid", MDB_CREATE, &m_dbi_seq_idx);
+    if (rc != MDB_SUCCESS) goto fail;
+    rc = mdb_dbi_open(txn, "groups", MDB_CREATE, &m_dbi_groups);
+    if (rc != MDB_SUCCESS) goto fail;
+    rc = mdb_dbi_open(txn, "friends", MDB_CREATE, &m_dbi_friends);
+    if (rc != MDB_SUCCESS) goto fail;
+
+    rc = mdb_txn_commit(txn);
+    if (rc != MDB_SUCCESS) {
+        qCritical() << "提交事务失败:" << mdb_strerror(rc);
+        return false;
+    }
+
+    qDebug() << "数据库已打开，目录:" << m_path << "初始mapsize:" << (m_currentMapSize >> 20) << "MB";
+    return true;
+
+fail:
+    mdb_txn_abort(txn);
+    qCritical() << "打开子数据库失败:" << mdb_strerror(rc);
+    return false;
+}
+
+// 关闭环境并释放所有句柄
+void BotDB::close()
+{
+    if (m_env) {
+        // 关闭所有已打开的 DBI
+        if (m_dbi_users) mdb_dbi_close(m_env, m_dbi_users);
+        if (m_dbi_seq_idx) mdb_dbi_close(m_env, m_dbi_seq_idx);
+        if (m_dbi_groups) mdb_dbi_close(m_env, m_dbi_groups);
+        if (m_dbi_friends) mdb_dbi_close(m_env, m_dbi_friends);
+        mdb_env_close(m_env);
+        m_env = nullptr;
+    }
+    m_dbi_users = m_dbi_seq_idx = m_dbi_groups = m_dbi_friends = 0;
+}
+
+// 重新打开环境（扩容后调用），保持原有的 m_currentMapSize
+bool BotDB::reopenEnvironment()
+{
+    if (m_env) close();
+
+    int rc = mdb_env_create(&m_env);
+    if (rc != MDB_SUCCESS) return false;
+
+    mdb_env_set_mapsize(m_env, m_currentMapSize);
+    QByteArray pathBytes = m_path.toUtf8();
+    rc = mdb_env_open(m_env, pathBytes.constData(), 0, 0664);
+    if (rc != MDB_SUCCESS) {
+        mdb_env_close(m_env);
+        m_env = nullptr;
+        return false;
+    }
+
+    ensureSparseFile();
+
+    // 重新打开所有子数据库
+    MDB_txn *txn = nullptr;
+    rc = mdb_txn_begin(m_env, nullptr, 0, &txn);
+    if (rc != MDB_SUCCESS) return false;
+
+    rc = mdb_dbi_open(txn, nullptr, MDB_CREATE, &m_dbi_users);
+    if (rc != MDB_SUCCESS) goto reopen_fail;
+    rc = mdb_dbi_open(txn, "seq_to_openid", MDB_CREATE, &m_dbi_seq_idx);
+    if (rc != MDB_SUCCESS) goto reopen_fail;
+    rc = mdb_dbi_open(txn, "groups", MDB_CREATE, &m_dbi_groups);
+    if (rc != MDB_SUCCESS) goto reopen_fail;
+    rc = mdb_dbi_open(txn, "friends", MDB_CREATE, &m_dbi_friends);
+    if (rc != MDB_SUCCESS) goto reopen_fail;
+
+    rc = mdb_txn_commit(txn);
+    if (rc != MDB_SUCCESS) goto reopen_fail;
+
+    qDebug() << "扩容后重新打开环境成功，新 mapsize:" << (m_currentMapSize >> 20) << "MB";
+    return true;
+
+reopen_fail:
+    mdb_txn_abort(txn);
+    close();
+    return false;
+}
+
+// 翻倍扩容
+bool BotDB::increaseMapSize()
+{
+    if (!m_env) return false;
+
+    size_t newSize = m_currentMapSize * 2;
+    // 防止溢出：最大限制为 16TB（可根据需求调整）
+    const size_t MAX_MAP_SIZE = 16ULL * 1024 * 1024 * 1024 * 1024; // 16TB
+    if (newSize > MAX_MAP_SIZE) {
+        qCritical() << "mapsize 超过最大限制，无法继续扩容";
+        return false;
+    }
+
+    qDebug() << "LMDB 空间不足，正在扩容:" << (m_currentMapSize >> 20) << "MB ->" << (newSize >> 20) << "MB";
+
+    // 关闭当前环境（会提交未完成事务？注意：调用此函数时外部已经回滚了失败的事务）
+    // 我们直接调用 reopenEnvironment 会调用 close()，然后使用新的 mapsize 打开
+    m_currentMapSize = newSize;
+    return reopenEnvironment();
+}
+
+// 泛型写入重试器
+template<typename Func>
+bool BotDB::retryWrite(Func writeFunc, int maxRetries)
+{
+    QMutexLocker locker(&m_mutex);
+    if (!m_env) return false;
+
+    int retry = 0;
+    while (retry <= maxRetries) {
+        MDB_txn *txn = nullptr;
+        int rc = mdb_txn_begin(m_env, nullptr, 0, &txn);
+        if (rc != MDB_SUCCESS) return false;
+
+        // 执行写入操作，它应该返回 0 表示成功，非 0 表示错误（可能是 MDB_MAP_FULL）
+        int opResult = writeFunc(txn);
+
+        if (opResult == MDB_SUCCESS) {
+            rc = mdb_txn_commit(txn);
+            if (rc == MDB_SUCCESS)
+                return true;
+            else if (rc == MDB_MAP_FULL) {
+                // 提交时也可能 MAP_FULL，需要回滚并扩容
+                mdb_txn_abort(txn);
+                // 尝试扩容
+                if (!increaseMapSize()) return false;
+                retry++;
+                continue;
+            } else {
+                mdb_txn_abort(txn);
+                return false;
+            }
+        } else if (opResult == MDB_MAP_FULL) {
+            mdb_txn_abort(txn);
+            if (!increaseMapSize()) return false;
+            retry++;
+            continue;
+        } else {
+            mdb_txn_abort(txn);
+            return false;
+        }
+    }
+    return false;
+}
+
+// ---------- 内部辅助函数（未修改，但注意 putRecord 等返回 int 以便重试器使用）----------
+uint32_t BotDB::nowMinutes()
+{
+    return static_cast<uint32_t>(std::time(nullptr) / 60);
+}
+
+// 修改 putRecord，返回 int (LMDB 错误码)
+int BotDB::putRecord(MDB_txn *txn, MDB_dbi dbi, const QByteArray &keyData, const void *data, size_t size)
+{
+    MDB_val key, value;
+    key.mv_data = (void*)keyData.constData();
+    key.mv_size = keyData.size();
+    value.mv_data = (void*)data;
+    value.mv_size = size;
+    return mdb_put(txn, dbi, &key, &value, 0);
+}
+
+bool BotDB::getRecord(MDB_txn *txn, MDB_dbi dbi, const QByteArray &keyData, void *outData, size_t size)
+{
+    MDB_val key, value;
+    key.mv_data = (void*)keyData.constData();
+    key.mv_size = keyData.size();
+    int rc = mdb_get(txn, dbi, &key, &value);
+    if (rc == MDB_SUCCESS && value.mv_size == size) {
+        memcpy(outData, value.mv_data, size);
+        return true;
+    }
+    return false;
+}
+
+int BotDB::delRecord(MDB_txn *txn, MDB_dbi dbi, const QByteArray &keyData)
+{
+    MDB_val key;
+    key.mv_data = (void*)keyData.constData();
+    key.mv_size = keyData.size();
+    return mdb_del(txn, dbi, &key, nullptr);
+}
+
+uint32_t BotDB::getNextSeqId(MDB_txn *txn)
+{
+    const char *seqKey = "_next_seq_id";
+    MDB_val key, value;
+    key.mv_data = (void*)seqKey;
+    key.mv_size = strlen(seqKey) + 1;
+
+    uint32_t nextId = 1;
+    int rc = mdb_get(txn, m_dbi_seq_idx, &key, &value);
+    if (rc == MDB_SUCCESS) {
+        nextId = *(uint32_t*)value.mv_data + 1;
+        if (nextId == 0) return 0;
+    } else if (rc != MDB_NOTFOUND) {
+        return 0;
+    }
+
+    value.mv_data = &nextId;
+    value.mv_size = sizeof(nextId);
+    rc = mdb_put(txn, m_dbi_seq_idx, &key, &value, 0);
+    return (rc == MDB_SUCCESS) ? nextId : 0;
+}
+
+bool BotDB::saveSeqToOpenId(MDB_txn *txn, uint32_t seqId, const QByteArray &openidBin)
+{
+    QByteArray keyData((char*)&seqId, sizeof(seqId));
+    return putRecord(txn, m_dbi_seq_idx, keyData, openidBin.constData(), openidBin.size()) == MDB_SUCCESS;
+}
+
+bool BotDB::getOpenIdBySeq(MDB_txn *txn, uint32_t seqId, QByteArray &outOpenidBin)
+{
+    QByteArray keyData((char*)&seqId, sizeof(seqId));
+    MDB_val key, value;
+    key.mv_data = keyData.data();
+    key.mv_size = keyData.size();
+    int rc = mdb_get(txn, m_dbi_seq_idx, &key, &value);
+    if (rc == MDB_SUCCESS) {
+        outOpenidBin = QByteArray((const char*)value.mv_data, value.mv_size);
+        return true;
+    }
+    return false;
+}
+
+// ---------- 公开 API 实现（全部使用 retryWrite）----------
+
+uint32_t BotDB::getOrUpdateUser(const QString &openid, QString &name)
+{
+    uint32_t resultSeq = 0;
+    bool success = retryWrite([&](MDB_txn *txn) -> int {
+        QByteArray keyData = QByteArray::fromHex(openid.toUtf8());
+        if (keyData.isEmpty()) return -1;
+
+        MDB_val key, value;
+        key.mv_data = keyData.data();
+        key.mv_size = keyData.size();
+
+        int rc = mdb_get(txn, m_dbi_users, &key, &value);
+        if (rc == MDB_NOTFOUND) {
+            // 初次写入：清零整个结构体
+            UserRecord record = {};
+            uint32_t newSeq = getNextSeqId(txn);
+            if (newSeq == 0) return -1;
+            record.seq_id = newSeq;
+            record.reserved_qq = 0;
+            record.record_time = nowMinutes();
+            record.invited_group_count = 0;
+
+            QByteArray nameBytes = name.toUtf8();
+            size_t copyLen = std::min<size_t>(63, (size_t)nameBytes.size());
+            memcpy(record.nickname, nameBytes.constData(), copyLen);
+            record.nickname[copyLen] = '\0';
+
+            rc = putRecord(txn, m_dbi_users, keyData, &record, sizeof(record));
+            if (rc != MDB_SUCCESS) return rc;
+            if (!saveSeqToOpenId(txn, newSeq, keyData)) return -1;
+            resultSeq = newSeq;
+            return MDB_SUCCESS;
+        } else if (rc == MDB_SUCCESS) {
+            UserRecord record;
+            memcpy(&record, value.mv_data, sizeof(UserRecord));
+
+            if (name.isEmpty()) {
+                name = QString::fromUtf8(record.nickname);   // 数据库中的 nickname 保证是干净的 UTF-8
+                resultSeq = record.seq_id;
+                return MDB_SUCCESS;
+            }
+
+            QByteArray newNameBytes = name.toUtf8();
+            if (strcmp(record.nickname, newNameBytes.constData()) != 0) {
+                size_t copyLen = std::min<size_t>(63, (size_t)newNameBytes.size());
+                memcpy(record.nickname, newNameBytes.constData(), copyLen);
+                record.nickname[copyLen] = '\0';
+                record.record_time = nowMinutes();
+                rc = putRecord(txn, m_dbi_users, keyData, &record, sizeof(record));
+                if (rc != MDB_SUCCESS) return rc;
+            }
+            resultSeq = record.seq_id;
+            return MDB_SUCCESS;
+        }
+        return rc;
+    });
+    return success ? resultSeq : 0;
+}
+
+bool BotDB::getUserBySeqId(uint32_t seq_id, UserRecord &outRecord)
+{
+    // 只读操作无需扩容，不加锁也可以（但为了安全可以使用读事务）
+    if (!m_env) return false;
+    MDB_txn *txn = nullptr;
+    int rc = mdb_txn_begin(m_env, nullptr, MDB_RDONLY, &txn);
+    if (rc != MDB_SUCCESS) return false;
+    QByteArray openidBin;
+    if (!getOpenIdBySeq(txn, seq_id, openidBin)) {
+        mdb_txn_abort(txn);
+        return false;
+    }
+    MDB_val key, value;
+    key.mv_data = openidBin.data();
+    key.mv_size = openidBin.size();
+    rc = mdb_get(txn, m_dbi_users, &key, &value);
+    if (rc == MDB_SUCCESS && value.mv_size == sizeof(UserRecord)) {
+        memcpy(&outRecord, value.mv_data, sizeof(UserRecord));
+        mdb_txn_abort(txn);
+        return true;
+    }
+    mdb_txn_abort(txn);
+    return false;
+}
+
+bool BotDB::incrementInvitedGroupCount(uint32_t seq_id, int delta)
+{
+    return retryWrite([&](MDB_txn *txn) -> int {
+        QByteArray openidBin;
+        if (!getOpenIdBySeq(txn, seq_id, openidBin))
+            return -1;
+        MDB_val key, value;
+        key.mv_data = openidBin.data();
+        key.mv_size = openidBin.size();
+        int rc = mdb_get(txn, m_dbi_users, &key, &value);
+        if (rc != MDB_SUCCESS) return rc;
+        UserRecord record;
+        memcpy(&record, value.mv_data, sizeof(record));
+        record.invited_group_count += delta;
+        return putRecord(txn, m_dbi_users, openidBin, &record, sizeof(record));
+    });
+}
+
+bool BotDB::addGroup(const QString &groupIdHex, uint32_t createTimeMinutes, uint32_t inviterSeqId)
+{
+    return retryWrite([&](MDB_txn *txn) -> int {
+        QByteArray keyData = QByteArray::fromHex(groupIdHex.toUtf8());
+        if (keyData.isEmpty()) return -1;
+        GroupRecord record{ createTimeMinutes, inviterSeqId };
+        return putRecord(txn, m_dbi_groups, keyData, &record, sizeof(record));
+    });
+}
+
+bool BotDB::getGroupInfo(const QString &groupIdHex, GroupRecord &outRecord)
+{
+    if (!m_env) return false;
+    QByteArray keyData = QByteArray::fromHex(groupIdHex.toUtf8());
+    if (keyData.isEmpty()) return false;
+    MDB_txn *txn = nullptr;
+    int rc = mdb_txn_begin(m_env, nullptr, MDB_RDONLY, &txn);
+    if (rc != MDB_SUCCESS) return false;
+    bool ok = getRecord(txn, m_dbi_groups, keyData, &outRecord, sizeof(outRecord));
+    mdb_txn_abort(txn);
+    return ok;
+}
+
+bool BotDB::isGroupExist(const QString &groupIdHex)
+{
+    GroupRecord dummy;
+    return getGroupInfo(groupIdHex, dummy);
+}
+
+bool BotDB::deleteGroup(const QString &groupIdHex)
+{
+    return retryWrite([&](MDB_txn *txn) -> int {
+        QByteArray keyData = QByteArray::fromHex(groupIdHex.toUtf8());
+        if (keyData.isEmpty()) return -1;
+        return delRecord(txn, m_dbi_groups, keyData);
+    });
+}
+
+uint64_t BotDB::makeFriendKey(uint32_t a, uint32_t b)
+{
+    if (a < b) return ((uint64_t)a << 32) | b;
+    else       return ((uint64_t)b << 32) | a;
+}
+
+// 添加好友：key = userSeqId，value = addTimeMinutes
+bool BotDB::addFriend(uint32_t userSeqId, uint32_t addTimeMinutes)
+{
+    QMutexLocker locker(&m_mutex);
+    QByteArray keyData((char*)&userSeqId, sizeof(userSeqId));
+    MDB_txn *txn = nullptr;
+    int rc = mdb_txn_begin(m_env, nullptr, 0, &txn);
+    if (rc != MDB_SUCCESS) return false;
+    bool ok = putRecord(txn, m_dbi_friends, keyData, &addTimeMinutes, sizeof(addTimeMinutes));
+    if (ok) {
+        rc = mdb_txn_commit(txn);
+        return rc == MDB_SUCCESS;
+    } else {
+        mdb_txn_abort(txn);
+        return false;
+    }
+}
+
+bool BotDB::removeFriend(uint32_t userSeqId)
+{
+    QMutexLocker locker(&m_mutex);
+    QByteArray keyData((char*)&userSeqId, sizeof(userSeqId));
+    MDB_txn *txn = nullptr;
+    int rc = mdb_txn_begin(m_env, nullptr, 0, &txn);
+    if (rc != MDB_SUCCESS) return false;
+    bool ok = delRecord(txn, m_dbi_friends, keyData);
+    if (ok) {
+        rc = mdb_txn_commit(txn);
+        return rc == MDB_SUCCESS;
+    } else {
+        mdb_txn_abort(txn);
+        return false;
+    }
+}
+
+bool BotDB::isFriend(uint32_t userSeqId)
+{
+    QByteArray keyData((char*)&userSeqId, sizeof(userSeqId));
+    MDB_txn *txn = nullptr;
+    int rc = mdb_txn_begin(m_env, nullptr, MDB_RDONLY, &txn);
+    if (rc != MDB_SUCCESS) return false;
+    uint32_t dummy;
+    bool ok = getRecord(txn, m_dbi_friends, keyData, &dummy, sizeof(dummy));
+    mdb_txn_abort(txn);
+    return ok;
+}
+
+QList<uint32_t> BotDB::getFriendList()
+{
+    QList<uint32_t> result;
+    MDB_txn *txn = nullptr;
+    int rc = mdb_txn_begin(m_env, nullptr, MDB_RDONLY, &txn);
+    if (rc != MDB_SUCCESS) return result;
+
+    MDB_cursor *cursor = nullptr;
+    if (mdb_cursor_open(txn, m_dbi_friends, &cursor) != MDB_SUCCESS) {
+        mdb_txn_abort(txn);
+        return result;
+    }
+
+    MDB_val key, value;
+    rc = mdb_cursor_get(cursor, &key, &value, MDB_FIRST);
+    while (rc == MDB_SUCCESS) {
+        if (key.mv_size == sizeof(uint32_t)) {
+            uint32_t userSeqId;
+            memcpy(&userSeqId, key.mv_data, sizeof(userSeqId));
+            result.append(userSeqId);
+        }
+        rc = mdb_cursor_get(cursor, &key, &value, MDB_NEXT);
+    }
+    mdb_cursor_close(cursor);
+    mdb_txn_abort(txn);
+    return result;
+}
+
+bool BotDB::getFriendAddTime(uint32_t userSeqId, uint32_t &outAddTimeMinutes)
+{
+    QByteArray keyData((char*)&userSeqId, sizeof(userSeqId));
+    MDB_txn *txn = nullptr;
+    int rc = mdb_txn_begin(m_env, nullptr, MDB_RDONLY, &txn);
+    if (rc != MDB_SUCCESS) return false;
+    bool ok = getRecord(txn, m_dbi_friends, keyData, &outAddTimeMinutes, sizeof(outAddTimeMinutes));
+    mdb_txn_abort(txn);
+    return ok;
+}
+
