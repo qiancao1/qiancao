@@ -211,21 +211,16 @@ void MainWindow::checkUpdate() {
 
 
 void MainWindow::startDownloadAndReplace(const QString &version, const QString &downloadUrl) {
-    // 生成新文件名（去掉版本号中的 'v' 前缀）
     QString cleanVersion = version;
     if (cleanVersion.startsWith('v')) cleanVersion.remove(0, 1);
     QString exeName = QString("qiancao-%1.exe").arg(cleanVersion);
     QString savePath = QCoreApplication::applicationDirPath() + "/" + exeName;
 
-    // 如果文件已存在，先删除
-    if (QFile::exists(savePath)) {
-        if (!QFile::remove(savePath)) {
-            QMessageBox::critical(this, "文件错误", "无法删除旧版本文件，请检查权限");
-            return;
-        }
+    if (QFile::exists(savePath) && !QFile::remove(savePath)) {
+        QMessageBox::critical(this, "文件错误", "无法删除旧版本文件");
+        return;
     }
 
-    // 创建进度对话框（使用指针）
     QProgressDialog *progressDialog = new QProgressDialog("正在下载更新...", "取消", 0, 100, this);
     progressDialog->setWindowTitle("更新");
     progressDialog->setMinimumDuration(0);
@@ -233,68 +228,100 @@ void MainWindow::startDownloadAndReplace(const QString &version, const QString &
     progressDialog->setAutoClose(false);
     progressDialog->show();
 
-    QNetworkAccessManager *downloadManager = new QNetworkAccessManager(this);
-    QNetworkReply *reply = downloadManager->get(QNetworkRequest(QUrl(downloadUrl)));
+    QNetworkRequest request((QUrl(downloadUrl)));
+    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
 
-    // 下载进度
-    connect(reply, &QNetworkReply::downloadProgress, [progressDialog](qint64 bytesReceived, qint64 bytesTotal) {
-        if (bytesTotal > 0) {
-            int percent = static_cast<int>((bytesReceived * 100) / bytesTotal);
-            progressDialog->setValue(percent);
+    QNetworkAccessManager *downloadManager = new QNetworkAccessManager(this);
+    QNetworkReply *reply = downloadManager->get(request);
+
+    connect(reply, &QNetworkReply::downloadProgress, [progressDialog](qint64 recv, qint64 total) {
+        if (total > 0) {
+            progressDialog->setValue(int(recv * 100 / total));
         } else {
             progressDialog->setValue(0);
         }
     });
 
-    // 用户取消
     connect(progressDialog, &QProgressDialog::canceled, [reply, downloadManager, progressDialog]() {
         reply->abort();
         progressDialog->close();
-        // 注意：不要在这里 delete，因为 finished 信号还会触发
     });
 
-    // 下载完成
     connect(reply, &QNetworkReply::finished, [=]() {
         progressDialog->setValue(100);
 
-        if (reply->error() == QNetworkReply::OperationCanceledError) {
+        // 辅助清理 lambda
+        auto cleanup = [reply, downloadManager, progressDialog]() {
             reply->deleteLater();
             downloadManager->deleteLater();
             progressDialog->deleteLater();
+        };
+
+        // 被取消
+        if (reply->error() == QNetworkReply::OperationCanceledError) {
+            cleanup();
             return;
         }
 
+        // 网络错误
         if (reply->error() != QNetworkReply::NoError) {
             QMessageBox::critical(this, "下载失败", "网络错误: " + reply->errorString());
-            reply->deleteLater();
-            downloadManager->deleteLater();
-            progressDialog->deleteLater();
+            cleanup();
+            return;
+        }
+
+        // 处理 HTTP 状态码
+        int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        QUrl finalUrl = reply->attribute(QNetworkRequest::RedirectionTargetAttribute).toUrl();
+        if (!finalUrl.isEmpty()) {
+            qDebug() << "检测到重定向到：" << finalUrl.toString();
+            QMessageBox::critical(this, "下载失败", "重定向未自动处理，请重试");
+            cleanup();
             return;
         }
 
         QByteArray data = reply->readAll();
-        reply->deleteLater();
+        qint64 actualSize = data.size();
+        qint64 expectedSize = reply->header(QNetworkRequest::ContentLengthHeader).toLongLong();
 
-        QFile file(savePath);
+        // 检查是否为 HTML 错误页面
+        if (data.size() < 500 && (data.contains("redirected") || data.contains("<html"))) {
+            QMessageBox::critical(this, "下载失败", "服务器返回了重定向页面，可能是网络问题");
+            cleanup();
+            return;
+        }
+
+        if (expectedSize > 0 && actualSize != expectedSize) {
+            QMessageBox::critical(this, "下载不完整",
+                                  QString("预期大小: %1 字节, 实际: %2 字节").arg(expectedSize).arg(actualSize));
+            cleanup();
+            return;
+        }
+
+        // 原子保存
+        QSaveFile file(savePath);
         if (!file.open(QIODevice::WriteOnly)) {
             QMessageBox::critical(this, "写入失败", "无法创建文件: " + savePath);
-            downloadManager->deleteLater();
-            progressDialog->deleteLater();
+            cleanup();
             return;
         }
         file.write(data);
-        file.close();
-        downloadManager->deleteLater();
-        progressDialog->deleteLater();
+        if (!file.commit()) {
+            QMessageBox::critical(this, "写入失败", "保存文件失败");
+            cleanup();
+            return;
+        }
 
         // 启动新程序
         if (!QProcess::startDetached(savePath, QStringList())) {
             QMessageBox::critical(this, "启动失败", "无法启动更新程序: " + savePath);
+            cleanup();
             return;
         }
 
-        // 关闭当前框架
+        // 关闭当前程序
         QCoreApplication::quit();
+        cleanup();
     });
 }
 void MainWindow::showUpdateDialog(const QString &version, const QString &releaseNotes, const QString &downloadUrl) {
@@ -338,7 +365,7 @@ void MainWindow::showUpdateDialog(const QString &version, const QString &release
         if (reply != QMessageBox::Yes) return;
 
         dialog.accept();
-
+        qDebug() << downloadUrl;
         startDownloadAndReplace(version, downloadUrl);
     });
     connect(cancelBtn, &QPushButton::clicked, &dialog, &QDialog::reject);
